@@ -1,13 +1,10 @@
-use super::{
-    r#struct::{generate_unit_struct, StructGenerator},
-    PreludeGenerator,
-};
+use super::{r#struct::StructGenerator, PreludeGenerator};
 use crate::binrw::{
     codegen::sanitization::{
         BACKTRACE_FRAME, BIN_ERROR, ERROR_BASKET, OPT, POS, READER, READ_METHOD,
         RESTORE_POSITION_VARIANT, TEMP, WITH_CONTEXT,
     },
-    parser::{Enum, EnumErrorMode, EnumVariant, Input, UnitEnumField, UnitOnlyEnum},
+    parser::{Enum, EnumErrorMode, EnumVariant, Input, Struct, UnitEnumField, UnitOnlyEnum},
 };
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -146,6 +143,7 @@ fn generate_unit_enum_magic(reader_var: &TokenStream, variants: &[UnitEnumField]
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn generate_data_enum(input: &Input, name: Option<&Ident>, en: &Enum) -> TokenStream {
     let return_all_errors = en.error_mode != EnumErrorMode::ReturnUnexpectedError;
 
@@ -182,28 +180,115 @@ pub(super) fn generate_data_enum(input: &Input, name: Option<&Ident>, en: &Enum)
 
     let reader_var = input.stream_ident_or(READER);
 
-    let try_each_variant = en.variants.iter().map(|variant| {
-        let body = generate_variant_impl(en, variant);
-
-        let handle_error = if return_all_errors {
-            let name = variant.ident().to_string();
-            quote! {
-                #ERROR_BASKET.push((#name, #TEMP));
+    // group fields by the type (Kind) of their magic value, preserve the order
+    let group_by_magic_type = en.variants.iter().fold(
+        Vec::new(),
+        |mut group_by_magic_type: Vec<(_, Vec<_>)>, field| {
+            let magic = match field {
+                EnumVariant::Variant { ident: _, options } => options.magic.clone(),
+                EnumVariant::Unit(field) => field.magic.clone(),
+            };
+            let kind = magic.as_ref().map(|magic| magic.kind().clone());
+            let last = group_by_magic_type.last_mut();
+            match last {
+                // if the current field's magic kind is the same as the previous one
+                // then add the current field to the same group
+                // if the magic kind is none then it's a wildcard, just add it to the previous group
+                Some((last_kind, last_vec)) if kind.is_none() || *last_kind == kind => {
+                    last_vec.push(field);
+                }
+                // otherwise if the vector is empty
+                // or the last field's magic kind is different
+                // then create a new group
+                _ => group_by_magic_type.push((kind, vec![field])),
             }
-        } else {
-            TokenStream::new()
+
+            group_by_magic_type
+        },
+    );
+
+    // for each type (Kind), read and try to match the magic of each field
+    let try_each_magic_type = group_by_magic_type.into_iter().map(|(kind, fields)| {
+        if kind.is_none() {
+            let try_each_variant = en.variants.iter().map(|variant| {
+                let body = generate_variant_impl(en, variant);
+
+                let handle_error = if return_all_errors {
+                    let name = variant.ident().to_string();
+                    quote! {
+                        #ERROR_BASKET.push((#name, #TEMP));
+                    }
+                } else {
+                    TokenStream::new()
+                };
+
+                quote! {
+                    match (|| {
+                        #body
+                    })() {
+                        ok @ Ok(_) => return ok,
+                        Err(error) => {
+                            #RESTORE_POSITION_VARIANT(#reader_var, #POS, error).map(|#TEMP| {
+                                #handle_error
+                            })?;
+                        }
+                    }
+                }
+            });
+            return quote! {
+                #(#try_each_variant)*
+            };
+        }
+
+        #[allow(clippy::match_on_vec_items)]
+        let magic = match fields[0] {
+            EnumVariant::Variant { ident: _, options } => options.magic.clone(),
+            EnumVariant::Unit(field) => field.magic.clone(),
+        };
+        let amp = magic.as_ref().map(|magic| magic.add_ref());
+
+        let matches = fields.iter().map(|field| {
+            let magic = match field {
+                EnumVariant::Variant { ident: _, options } => options.magic.clone(),
+                EnumVariant::Unit(field) => field.magic.clone(),
+            };
+            let pre_assertions = match field {
+                EnumVariant::Variant { ident: _, options } => options.pre_assertions.clone(),
+                EnumVariant::Unit(field) => field.pre_assertions.clone(),
+            };
+            let variant_impl = generate_variant_impl(en, field);
+            if let Some(magic) = magic {
+                let magic = magic.match_value();
+                let condition = if pre_assertions.is_empty() {
+                    quote! { #magic }
+                } else {
+                    let pre_assertions = pre_assertions.iter().map(|assert| &assert.condition);
+                    quote! { #magic if true #(&& (#pre_assertions))* }
+                };
+
+                quote! {
+                    #condition => (|| { #variant_impl } )()
+                }
+            } else {
+                quote! {
+                    _ => (|| { #variant_impl } )()
+                }
+            }
+        });
+
+        let body = quote! {
+            match #amp #READ_METHOD(#reader_var, #OPT, ())? {
+                #(#matches,)*
+                _ => Err(#BIN_ERROR::NoVariantMatch { pos: #POS })
+            }
         };
 
         quote! {
             match (|| {
                 #body
             })() {
-                ok @ Ok(_) => return ok,
-                Err(error) => {
-                    #RESTORE_POSITION_VARIANT(#reader_var, #POS, error).map(|#TEMP| {
-                        #handle_error
-                    })?;
-                }
+                v @ Ok(_) => return v,
+                Err(#TEMP) => { #RESTORE_POSITION_VARIANT(#reader_var, #POS, #TEMP)?; }
             }
         }
     });
@@ -211,13 +296,15 @@ pub(super) fn generate_data_enum(input: &Input, name: Option<&Ident>, en: &Enum)
     quote! {
         #prelude
         #create_error_basket
-        #(#try_each_variant)*
+        #(#try_each_magic_type)*
         #return_error
     }
 }
 
 fn generate_variant_impl(en: &Enum, variant: &EnumVariant) -> TokenStream {
-    let input = Input::Struct(variant.clone().into());
+    let mut struc: Struct = variant.clone().into();
+    struc.magic = None;
+    let input = Input::Struct(struc);
 
     match variant {
         EnumVariant::Variant { ident, options } => StructGenerator::new(&input, options)
@@ -228,7 +315,9 @@ fn generate_variant_impl(en: &Enum, variant: &EnumVariant) -> TokenStream {
             .initialize_value_with_assertions(Some(ident), &en.assertions)
             .return_value()
             .finish(),
-
-        EnumVariant::Unit(options) => generate_unit_struct(&input, None, Some(&options.ident)),
+        EnumVariant::Unit(options) => {
+            let ident = &options.ident;
+            quote! { Ok(Self::#ident) }
+        }
     }
 }

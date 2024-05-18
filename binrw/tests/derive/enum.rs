@@ -185,11 +185,11 @@ fn enum_magic_holey() {
     #[derive(BinRead, Debug, PartialEq)]
     #[br(big, magic(0x12u8))]
     enum Test {
-        Wrong(#[br(magic(0x01u8))] u16),
         #[br(magic(0x12u8))]
         Right {
             a: u16,
         },
+        Wrong(#[br(magic(0x01u8))] u16),
     }
 
     let result = Test::read(&mut Cursor::new(b"\x12\x12\x01\x02\x03")).unwrap();
